@@ -1,60 +1,74 @@
-# Guía Definitiva: Tailscale Funnel y Serve en Docker Compose (Entornos Productivos)
+# Exposición de Backend Local a Internet con Tailscale Funnel y Docker
 
-Esta guía detalla cómo desplegar Tailscale como un **Gateway (Reverse Proxy)** declarativo para múltiples microservicios utilizando Docker Compose, garantizando tolerancia a fallos, seguridad y persistencia.
-
-## Arquitectura del Despliegue
-
-Utilizaremos una **red interna de Docker**. Tailscale será el único servicio con salida a Internet (a través de Funnel). Los microservicios (Frontend, Backend, etc.) no tendrán puertos expuestos al servidor físico, comunicándose con Tailscale de forma aislada mediante el DNS interno de Docker.
+Esta guía documenta la configuración utilizada para exponer una API local que corre en el puerto `4000` hacia internet público mediante **Tailscale Funnel** dentro de un contenedor Docker, con certificados TLS/HTTPS automáticos.
 
 ---
 
-## 1. Estructura del Proyecto
+## 1. Requisitos previos en el Panel de Tailscale
 
-Crea una carpeta en tu servidor Ubuntu (por ejemplo, `/opt/mi-proyecto`) con la siguiente estructura:
+Antes de levantar el contenedor, es obligatorio habilitar dos opciones en la consola web de Tailscale (`https://tailscale.com`):
+
+1. **Habilitar HTTPS:**
+   - Ir a **DNS -> HTTPS Certificates** y hacer clic en **Enable HTTPS**.
+2. **Permisos de Funnel (ACL):**
+   - Asegurarse de que la cuenta/nodo tenga habilitada la capacidad `funnel` (se aprueba la primera vez desde el enlace que genera el comando `tailscale funnel`).
+
+---
+
+## 2. Estructura de Archivos
 
 ```text
-mi-proyecto/
+.tailscale/
+├── .env
 ├── docker-compose.yml
 ├── serve.json
-├── .env
-└── tailscale-data/      # (Se creará automáticamente)
-
+└── tailscale-data/   # Carpeta generada automáticamente para persistir el estado
 ```
 
-### Configuración del `.gitignore` (Si usas Git)
-
-Nunca subas tus secretos ni el estado del nodo al repositorio. Crea un archivo `.gitignore`:
-
-```text
-.env
-tailscale-data/
-
-```
-
----
-
-## 2. Archivo de Variables de Entorno (`.env`)
-
-Ve a tu panel de Tailscale, genera una **Auth Key** asegurándote de que sea **Reusable** y **NO Ephemeral** (no efímera). Guárdala en el archivo `.env`.
-
-**Archivo `.env**`:
+### Archivo `.env`
+El `TS_HOSTNAME` debe ser un nombre corto (sin incluir `.tailnet.ts.net`), ya que Tailscale concatena automáticamente el dominio de tu red.
 
 ```env
-# Clave de autenticación de Tailscale
-TS_AUTHKEY=tskey-auth-tuClaveSecretaAqui
-
-# Nombre fijo para tu servidor en Tailscale
-TS_HOSTNAME=servidor-prod
-
+TS_HOSTNAME=gateway
+TS_AUTHKEY=tskey-auth-tu-clave-aqui
 ```
 
----
+### Archivo `docker-compose.yml`
+Se utiliza `network_mode: host` para que el contenedor de Tailscale comparta la red de la máquina anfitriona y pueda comunicarse directamente con `http://localhost:4000` (donde corren los demás servicios).
 
-## 3. Configuración Declarativa de Rutas (`serve.json`)
+```yaml
+services:
+  tailscale-gateway:
+    image: tailscale/tailscale:latest
+    container_name: tailscale-gateway
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SERVE_CONFIG=/config/serve.json
+      - TS_USERSPACE=false
+    volumes:
+      - ./tailscale-data:/var/lib/tailscale
+      - ./serve.json:/config/serve.json
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_MODULE
+    restart: unless-stopped
+```
 
-Este archivo le dice a Tailscale cómo enrutar el tráfico que entra por el puerto 443 (HTTPS) hacia los contenedores internos. Usaremos los nombres de los contenedores (`frontend`, `backend`) en lugar de `127.0.0.1`.
+> **Nota:** Al usar `network_mode: host`, no se debe definir la propiedad `hostname:` en el `docker-compose.yml` para evitar sobrescribir el hostname del sistema operativo anfitrión; Tailscale toma el nombre desde la variable `TS_HOSTNAME` del `.env`.
 
-**Archivo `serve.json**`:
+### Archivo `serve.json`
+Configura el proxy inverso en el puerto `443`, enruta cada microservicio por su
+prefijo y habilita la exposición pública (`AllowFunnel`).
+
+Los handlers se resuelven por el prefijo más largo; se declaran con y sin slash
+final para cubrir la ruta exacta y sus descendientes. El API de inventario vive
+en `/api/v1/inventory` (su `API_PREFIX`), así que el `Proxy` apunta al puerto
+`4000` sin reescribir el path. Cada microservicio nuevo agrega su propio handler.
 
 ```json
 {
@@ -64,112 +78,67 @@ Este archivo le dice a Tailscale cómo enrutar el tráfico que entra por el puer
     }
   },
   "Web": {
-    "${TS_CERT_DOMAIN}:443": {
+    "\${TS_CERT_DOMAIN}:443": {
       "Handlers": {
-        "/": {
-          "Proxy": "http://localhost:4200"
+        "/api/v1/inventory": {
+          "Proxy": "http://localhost:4000"
         },
-        "/api": {
+        "/api/v1/inventory/": {
           "Proxy": "http://localhost:4000"
         }
       }
     }
   },
   "AllowFunnel": {
-    "${TS_CERT_DOMAIN}:443": true
+    "\${TS_CERT_DOMAIN}:443": true
   }
 }
 ```
 
-> **Nota:** La variable `${TS_CERT_DOMAIN}` será reemplazada automáticamente por tu dominio de Tailscale (ej. `servidor-prod.alias.ts.net`).
+> `/health` y `/ready` no se publican en el gateway: el frontend los consulta
+> bajo el prefijo (`/api/v1/inventory/ready`) y Docker Compose los sigue llamando
+> en raíz dentro del contenedor.
 
 ---
 
-## 4. Orquestación (`docker-compose.yml`)
+## 3. Despliegue y Activación
 
-Aquí definimos la red interna y los servicios. Observa que el `backend` y `frontend` **no tienen la directiva `ports**`, lo que los hace 100% seguros frente a escaneos de red externos.
+### 1. Levantar el contenedor
+```bash
+docker compose up -d
+```
 
-**Archivo `docker-compose.yml**`:
+### 2. Generar certificado y activar Funnel (Primera vez)
+En instalaciones nuevas, es necesario forzar la emisión del certificado TLS y activar Funnel mediante el socket interno de Tailscale (`/tmp/tailscaled.sock`):
 
-```yaml
-networks:
-  tailnet_internal:
-    driver: bridge
+```bash
+# Solicitar certificado SSL
+docker exec tailscale-gateway tailscale --socket=/tmp/tailscaled.sock cert gateway.tail224652.ts.net
 
-services:
-  # 1. Gateway: Tailscale
-  tailscale:
-    image: tailscale/tailscale:v1.64.0 # Buena práctica: Usar una versión específica en lugar de 'latest'
-    container_name: tailscale-gateway
-    hostname: ${TS_HOSTNAME}
-    env_file:
-      - .env
-    environment:
-      - TS_STATE_DIR=/var/lib/tailscale
-      - TS_SERVE_CONFIG=/config/serve.json
-      - TS_USERSPACE=false
-    volumes:
-      - ./tailscale-data:/var/lib/tailscale # Estado y criptografía persistente
-      - ./serve.json:/config/serve.json # Archivo de rutas
-      - /dev/net/tun:/dev/net/tun
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    networks:
-      - tailnet_internal
-    restart: unless-stopped
-
-  # 2. Microservicio: Backend (API)
-  backend:
-    image: tu-usuario/mi-backend:v1.0.0 # Cambia por tu imagen o usa `build: ./ruta`
-    container_name: backend
-    environment:
-      - NODE_ENV=production
-    networks:
-      - tailnet_internal
-    depends_on:
-      - tailscale
-    restart: unless-stopped
-
-  # 3. Microservicio: Frontend (Web)
-  frontend:
-    image: tu-usuario/mi-frontend:v1.0.0 # Cambia por tu imagen o usa `build: ./ruta`
-    container_name: frontend
-    networks:
-      - tailnet_internal
-    depends_on:
-      - tailscale
-    restart: unless-stopped
+# Activar Funnel en segundo plano apuntando al puerto local 4000
+docker exec tailscale-gateway tailscale --socket=/tmp/tailscaled.sock funnel --bg 4000
 ```
 
 ---
 
-## 5. Buenas Prácticas Productivas Aplicadas
+## 4. Comandos Útiles de Verificación y Mantenimiento
 
-1. **Aislamiento Total de Red (Zero Trust):** Al usar una red `bridge` de Docker (`tailnet_internal`) y no usar la directiva `ports:`, es físicamente imposible acceder a tus microservicios escaneando la IP pública de tu servidor o tu IP local. La única puerta de entrada es a través del túnel cifrado de Tailscale.
-2. **Infraestructura como Código (IaC):** Con `serve.json`, las rutas de tu Reverse Proxy quedan documentadas y versionables. Si el servidor se destruye, puedes levantarlo en otro lugar en 1 minuto ejecutando `docker compose up -d`.
-3. **Gestión de Secretos Segura:** Extraer la `TS_AUTHKEY` a un archivo `.env` evita que las claves de acceso queden expuestas en el código fuente de tu repositorio.
-4. **Fijación de Versiones (Pinning):** Se recomienda usar una versión fija de Tailscale (ej. `v1.64.0`) en lugar de `latest`. Esto evita que una actualización automática con "breaking changes" tumbe tus servicios en producción tras un reinicio.
-5. **Persistencia Total:** El volumen `./tailscale-data` garantiza que tu dominio asignado (`servidor-prod.alias.ts.net`) no cambie jamás, incluso si el servidor pierde energía o se reinicia.
+- **Verificar estado de rutas y Funnel activo:**
+  ```bash
+  docker exec tailscale-gateway tailscale --socket=/tmp/tailscaled.sock serve status
+  ```
 
----
+- **Verificar resolución DNS pública (saltando caché local):**
+  ```bash
+  dig +short @1.1.1.1 gateway.tail224652.ts.net
+  ```
 
-## 6. Despliegue y Comprobación
+- **Probar endpoint público:**
+  ```bash
+  curl -i https://ts.net
+  ```
 
-1. **Levantar todo el stack:**
-
-```bash
-  docker compose up -d
-```
-
-2. **Verificar el estado del túnel y las rutas:**
-
-```bash
-  docker compose exec tailscale tailscale funnel status
-```
-
-3. **Verificar los logs en caso de error:**
-
-```bash
-  docker compose logs -f tailscale
-```
+- **Reiniciar tras cambios en `serve.json` o `.env`:**
+  ```bash
+  docker compose up -d --force-recreate
+  ```
