@@ -67,8 +67,9 @@ prefijo y habilita la exposición pública (`AllowFunnel`).
 
 Los handlers se resuelven por el prefijo más largo; se declaran con y sin slash
 final para cubrir la ruta exacta y sus descendientes. El API de inventario vive
-en `/api/v1/inventory` (su `API_PREFIX`), así que el `Proxy` apunta al puerto
-`4000` sin reescribir el path. Cada microservicio nuevo agrega su propio handler.
+en `/api/v1/inventory` (puerto `4000`) y el de restaurantes en
+`/api/v1/restaurant` (puerto `4002`). Cada `Proxy` apunta a su puerto sin
+reescribir el path.
 
 ```json
 {
@@ -85,6 +86,12 @@ en `/api/v1/inventory` (su `API_PREFIX`), así que el `Proxy` apunta al puerto
         },
         "/api/v1/inventory/": {
           "Proxy": "http://localhost:4000"
+        },
+        "/api/v1/restaurant": {
+          "Proxy": "http://localhost:4002"
+        },
+        "/api/v1/restaurant/": {
+          "Proxy": "http://localhost:4002"
         }
       }
     }
